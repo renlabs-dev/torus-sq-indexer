@@ -122,13 +122,13 @@ type BridgeAction @entity {
 }
 
 type BridgeTransfer @entity {
-  id: ID!
+    id: ID!
 
-  evmAddress: String! @index
-  address: String! @index
-  intermediaryAddress: String! @index
+    evmAddress: String! @index
+    address: String! @index
+    intermediaryAddress: String! @index
 
-  amountBridged: BigInt! @index
+    amountBridged: BigInt! @index
 
-  toBase: Boolean! @index
+    toBase: Boolean! @index
 }

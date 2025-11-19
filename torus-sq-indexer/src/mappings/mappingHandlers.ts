@@ -550,9 +550,22 @@ export async function handleAgentRegistered(event: SubstrateEvent): Promise<void
   const key = data[0].toString();
 
   const {method: {args, method, section}} = event.extrinsic.extrinsic;
-  const name = `${args[1].toHuman()}`;
-  const url = `${args[3].toHuman()}`;
-  const metadata = `${args[2].toHuman()}`;
+  let name, url, metadata;
+  try {
+    name = `${args[1].toHuman()}`;
+  } catch (e) {
+    name = args[1]?.toString?.() ?? '';
+  }
+  try {
+    url = `${args[3].toHuman()}`;
+  } catch (e) {
+    url = args[3]?.toString?.() ?? '';
+  }
+  try {
+    metadata = `${args[2].toHuman()}`;
+  } catch (e) {
+    metadata = args[2]?.toString?.() ?? '';
+  }
 
   const entity = Agent.create({
     id: key,
