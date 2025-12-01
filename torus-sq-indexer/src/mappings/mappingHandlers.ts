@@ -15,8 +15,32 @@ import {
   DelegationEvent,
   Agent, ChainInfo, BridgeAction, BridgeTransfer
 } from "../types";
-import {decFreeBalance, incFreeBalance, initAccount, stakeBalance, unstakeBalance} from "../helpers";
 import {ZERO, formattedNumber, bridged} from "../utils/consts";
+
+// Track accounts with recent activity for selective syncing
+const activeAccounts = new Set<string>();
+
+// Type definition for Substrate AccountInfo structure
+// Matches the structure returned by api.query.system.account()
+interface SubstrateAccountData {
+  free: { toString(): string };
+  reserved: { toString(): string };
+  miscFrozen?: { toString(): string };
+  feeFrozen?: { toString(): string };
+}
+
+interface SubstrateAccountInfo {
+  data: SubstrateAccountData;
+  nonce?: { toString(): string };
+  consumers?: { toString(): string };
+  providers?: { toString(): string };
+  sufficients?: { toString(): string };
+}
+
+// Type guard to safely access account info
+function getAccountInfo(codec: unknown): SubstrateAccountInfo {
+  return codec as SubstrateAccountInfo;
+}
 
 export async function fetchExtrinsics(block: SubstrateBlock): Promise<void> {
 
@@ -212,6 +236,10 @@ export async function handleTransfer(event: SubstrateEvent): Promise<void> {
     const to = data[1].toString();
     const amount = BigInt(data[2].toString());
 
+    // Track accounts for selective syncing
+    activeAccounts.add(from);
+    activeAccounts.add(to);
+
     const blockNumber = number.toNumber();
     const extrinsicId = event.phase.asApplyExtrinsic.toPrimitive() as number;
 
@@ -251,9 +279,6 @@ export async function handleTransfer(event: SubstrateEvent): Promise<void> {
 
       })
     }
-
-    await incFreeBalance(to, amount, blockNumber);
-    await decFreeBalance(from, amount, blockNumber);
 
     await entity.save();
   }catch (e) {
@@ -300,7 +325,7 @@ export async function fetchDelegations(block: SubstrateBlock): Promise<void> {
     //killed accounts fix
     for (const stakingAccount of stakingAccounts) {
       api.query.system.account(stakingAccount).then(acc =>{
-        let freebalance = BigInt(acc.data.free.toString());
+        let freebalance = BigInt(getAccountInfo(acc).data.free.toString());
         if(freebalance === ZERO){
           Account.get(stakingAccount).then(async killedAccount => {
             if (killedAccount) {
@@ -417,42 +442,50 @@ async function handleKillAccount(event: SubstrateEvent): Promise<void> {
 
 
 async function updateAllAccounts(block: SubstrateBlock) {
-
   if (!api) throw new Error("API not initialized");
-try{
 
+  try {
+    const height = block.block.header.number.toNumber();
 
-  const height = block.block.header.number.toNumber();
-  const hash = block.block.header.hash.toString();
+    // Determine if we should do a full sync (every 1000 blocks) or selective sync
+    const shouldFullSync = height % 1000 === 0;
 
-  const apiAt = api;
+    let accountsToSync: string[] = [];
 
-  let entities: Account[] = [];
-  const accounts = await apiAt.query.system.account.entries();
+    if (shouldFullSync) {
+      // Full sync: fetch all accounts from chain
+      logger.info(`[FULL SYNC] Block ${height}: Syncing all accounts`);
+      const allAccounts = await api.query.system.account.entries();
+      accountsToSync = allAccounts.map(([key, _]) => `${key.toHuman()}`);
+    } else {
+      // Selective sync: only sync active accounts
+      accountsToSync = Array.from(activeAccounts);
+      if (accountsToSync.length > 0) {
+        logger.info(`[SELECTIVE SYNC] Block ${height}: Syncing ${accountsToSync.length} active accounts`);
+      }
+    }
 
-  for (const account of accounts) {
-    const address = `${account[0].toHuman()}`;
+    // Sync the selected accounts
+    const entities: Account[] = [];
 
-    const freeBalance = BigInt(account[1].data.free.toString());
-    const stakedBalance = BigInt(account[1].data.reserved.toString());
-    // (await DelegateBalance.getByAccount(address, {limit: 100}))?.reduce(
-    //     (accumulator, delegation) => accumulator + delegation.amount,
-    //     ZERO) ?? ZERO;
+    for (const address of accountsToSync) {
+      const chainAccount = await api.query.system.account(address);
+      const accountInfo = getAccountInfo(chainAccount);
 
-    const totalBalance = freeBalance + stakedBalance;
+      const freeBalance = BigInt(accountInfo.data.free.toString());
+      const stakedBalance = BigInt(accountInfo.data.reserved.toString());
+      const totalBalance = freeBalance + stakedBalance;
 
-    const existingAccount = await Account.get(address);
+      const existingAccount = await Account.get(address);
 
-    if(existingAccount){
-      existingAccount.updatedAt = height;
-      existingAccount.balance_free = freeBalance;
-      existingAccount.balance_total = totalBalance;
-      existingAccount.balance_staked = stakedBalance;
-      existingAccount.save().then(() =>{
-        //saved
-      })
-    }else {
-      entities.push(
+      if (existingAccount) {
+        existingAccount.updatedAt = height;
+        existingAccount.balance_free = freeBalance;
+        existingAccount.balance_total = totalBalance;
+        existingAccount.balance_staked = stakedBalance;
+        await existingAccount.save();
+      } else {
+        entities.push(
           Account.create({
             id: address,
             address,
@@ -462,13 +495,20 @@ try{
             balance_staked: stakedBalance,
             balance_total: totalBalance,
           })
-      );
+        );
+      }
     }
+
+    if (entities.length > 0) {
+      await store.bulkCreate("Account", entities);
+    }
+
+    // Clear active accounts set after syncing
+    activeAccounts.clear();
+
+  } catch (e) {
+    logger.error(`ACCOUNTS ERROR ${e}`);
   }
-  await store.bulkCreate("Account", entities);
-}catch (e) {
-  logger.info(`ACCOUNTS ERROR ${e}`);
-}
 }
 
 
@@ -497,6 +537,9 @@ const handleDelegation = async (
 
     if (amount === ZERO) return;
 
+    // Track account for selective syncing
+    activeAccounts.add(account);
+
     const eventRecord = DelegationEvent.create({
       id: `${height}-${account}-${agent}`,
       height,
@@ -522,10 +565,8 @@ const handleDelegation = async (
     }
     if (action === DelegateAction.DELEGATE) {
       balanceRecord.amount += amount;
-      stakeBalance(account, amount, event.block.block.header.number.toNumber());
     } else {
       balanceRecord.amount -= amount;
-      unstakeBalance(account, amount, event.block.block.header.number.toNumber());
       if (balanceRecord.amount < ZERO) {
         balanceRecord.amount = ZERO;
       }

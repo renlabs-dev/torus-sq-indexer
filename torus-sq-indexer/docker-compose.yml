@@ -1,5 +1,3 @@
-version: "3"
-
 services:
   postgres:
     build:
@@ -11,6 +9,40 @@ services:
       - .data/postgres:/var/lib/postgresql/data
     environment:
       POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - shared_buffers=4GB
+      - -c
+      - effective_cache_size=12GB
+      - -c
+      - maintenance_work_mem=2GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - work_mem=128MB
+      - -c
+      - max_connections=100
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - min_wal_size=2GB
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+      - -c
+      - autovacuum=off
+      - -c
+      - commit_delay=100000
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -29,6 +61,7 @@ services:
       DB_DATABASE: postgres
       DB_HOST: postgres
       DB_PORT: 5432
+      NODE_ENV: production
     volumes:
       - ./:/app
     command:
@@ -36,8 +69,11 @@ services:
       - -f=/app
       - --db-schema=app
       - --workers=4
-      - --batch-size=30
-      - --unfinalized-blocks=true
+      - --batch-size=500
+      - --unfinalized-blocks=false
+      - --timeout=300000
+      - --store-cache-threshold=5000
+      - --store-flush-interval=30
     healthcheck:
       test: ["CMD", "curl", "-f", "http://subquery-node:3000/ready"]
       interval: 3s
@@ -64,3 +100,4 @@ services:
       - --name=app
       - --playground
       - --indexer=http://subquery-node:3000
+      - --cors-origin=*

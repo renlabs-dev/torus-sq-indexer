@@ -1,0 +1,69 @@
+# // Auto-generated , DO NOT EDIT
+specVersion: 1.0.0
+version: 0.0.1
+name: polkadot-starter
+description: >-
+  This project can be used as a starting point for developing your SubQuery
+  project
+runner:
+  node:
+    name: '@subql/node'
+    version: '>=3.0.1'
+    options:
+      historical: false
+      unfinalizedBlocks: false
+  query:
+    name: '@subql/query'
+    version: '*'
+schema:
+  file: ./schema.graphql
+network:
+  chainId: '0x0e00b212768e28b176d069890c106e37c331ea9b16b207f4e9baf67b3f3f3021'
+  endpoint:
+    - wss://archive.torus.network
+dataSources:
+  - kind: substrate/Runtime
+    startBlock: 1
+    endBlock: 1
+    mapping:
+      file: ./dist/index.js
+      handlers:
+        - kind: substrate/BlockHandler
+          handler: handleGenesisBalances
+  - kind: substrate/Runtime
+    startBlock: 1
+    mapping:
+      file: ./dist/index.js
+      handlers:
+        - kind: substrate/BlockHandler
+          handler: fetchExtrinsics
+        - kind: substrate/EventHandler
+          handler: handleTransfer
+          filter:
+            module: balances
+            method: Transfer
+        - kind: substrate/EventHandler
+          handler: handleStakeRemoved
+          filter:
+            module: torus0
+            method: StakeRemoved
+        - kind: substrate/EventHandler
+          handler: handleStakeAdded
+          filter:
+            module: torus0
+            method: StakeAdded
+        - kind: substrate/EventHandler
+          handler: handleAgentRegistered
+          filter:
+            module: torus0
+            method: AgentRegistered
+        - kind: substrate/EventHandler
+          handler: handleAgentUpdated
+          filter:
+            module: torus0
+            method: AgentUpdated
+        - kind: substrate/EventHandler
+          handler: handleAgentUnregistered
+          filter:
+            module: torus0
+            method: AgentUnregistered

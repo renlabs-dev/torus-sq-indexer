@@ -76,14 +76,14 @@ const project: SubstrateProject = {
             kind: SubstrateHandlerKind.Block,
             handler: "fetchAccounts",
             filter: {
-              modulo: 100,
+              modulo: 1,  // Sync every block for accurate balances
             },
           },
           {
             kind: SubstrateHandlerKind.Block,
             handler: "fetchDelegations",
             filter: {
-              modulo: 100,
+              modulo: 1,  // Sync every block to match account sync
             },
           },
           {
