@@ -27,7 +27,7 @@ const project: SubstrateProject = {
       name: "@subql/node",
       version: ">=3.0.1",
       options: {
-        historical: true,
+        historical: false,
         unfinalizedBlocks: false
       }
     },
@@ -74,16 +74,9 @@ const project: SubstrateProject = {
         handlers: [
           {
             kind: SubstrateHandlerKind.Block,
-            handler: "fetchAccounts",
-            filter: {
-              modulo: 100,
-            },
-          },
-          {
-            kind: SubstrateHandlerKind.Block,
             handler: "fetchDelegations",
             filter: {
-              modulo: 100,
+              modulo: 100,  // Sync every 100 blocks (when staking rewards are distributed)
             },
           },
           {
