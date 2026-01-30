@@ -291,61 +291,51 @@ export async function handleTransfer(event: SubstrateEvent): Promise<void> {
 export async function fetchDelegations(block: SubstrateBlock): Promise<void> {
   if (!api) return;
 
-  const apiAt = api
-
-  logger.info(`#${block.block.header.number.toNumber()}: fetchDelegations`);
   const height = block.block.header.number.toNumber();
+  logger.info(`#${height}: fetchDelegations`);
 
-  apiAt.query.torus0.stakingTo.entries().then(async stakeTo => {
-    const records: DelegateBalance[] = [];
-    // logger.info(`#${height}: syncStakedAmount`);
-    let stakingAccounts: string[] = [];
+  const stakeTo = await api.query.torus0.stakingTo.entries();
+  const records: DelegateBalance[] = [];
+  const accountStakes = new Map<string, bigint>();
 
-    for (const [key, value] of stakeTo) {
-      const [account, agent] = key.toHuman() as [string, string];
-      const amount = BigInt(value.toString());
+  for (const [key, value] of stakeTo) {
+    const [account, agent] = key.toHuman() as [string, string];
+    const amount = BigInt(value.toString());
 
-      if (amount === ZERO) continue;
+    if (amount === ZERO) continue;
 
-      stakingAccounts.includes(account) || stakingAccounts.push(account);
+    accountStakes.set(account, (accountStakes.get(account) ?? ZERO) + amount);
 
-      records.push(
-          DelegateBalance.create({
-            id: `${account}-${agent}`,
-            lastUpdate: height,
-            account,
-            agent,
-            amount,
-          })
-      );
+    records.push(
+        DelegateBalance.create({
+          id: `${account}-${agent}`,
+          lastUpdate: height,
+          account,
+          agent,
+          amount,
+        })
+    );
+  }
+
+  await store.bulkCreate("DelegateBalance", records);
+
+  // Update Account.balanceStaked in parallel (not sequentially)
+  logger.info(`#${height}: Updating ${accountStakes.size} account staked balances`);
+  const accountIds = Array.from(accountStakes.keys());
+  const accounts = await Promise.all(accountIds.map(id => Account.get(id)));
+
+  const savePromises: Promise<void>[] = [];
+  for (let i = 0; i < accountIds.length; i++) {
+    const account = accounts[i];
+    if (account) {
+      const stakedBalance = accountStakes.get(accountIds[i])!;
+      account.balance_staked = stakedBalance;
+      account.balance_total = account.balance_free + stakedBalance;
+      account.updatedAt = height;
+      savePromises.push(account.save());
     }
-//     await removeAllDelegateBalanceRecords();
-    await store.bulkCreate("DelegateBalance", records);
-
-    //killed accounts fix
-    for (const stakingAccount of stakingAccounts) {
-      api.query.system.account(stakingAccount).then(acc =>{
-        let freebalance = BigInt(getAccountInfo(acc).data.free.toString());
-        if(freebalance === ZERO){
-          Account.get(stakingAccount).then(async killedAccount => {
-            if (killedAccount) {
-              const stakedBalance = (await DelegateBalance.getByAccount(stakingAccount, {limit: 100}))?.reduce(
-                  (accumulator, delegation) => accumulator + delegation.amount,
-                  ZERO) ?? ZERO;
-
-                killedAccount.balance_total = stakedBalance;
-                killedAccount.balance_free = ZERO;
-                killedAccount.balance_staked = stakedBalance;
-                killedAccount.updatedAt = height;
-                await killedAccount.save();
-            }
-          })
-        }
-      });
-    }
-
-  })
-
+  }
+  await Promise.all(savePromises);
 }
 
 export async function fetchAccounts(block: SubstrateBlock): Promise<void> {
