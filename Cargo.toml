@@ -1,0 +1,23 @@
+[package]
+name = "torus-indexer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/renlabs-dev/torus-sq-indexer"
+description = "Minimal Torus indexer: transfers and account balances"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+parity-scale-codec = { version = "3", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sp-crypto-hashing = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "derive"] }
+subxt = "0.42"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

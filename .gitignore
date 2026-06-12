@@ -1,0 +1,11 @@
+/target/
+/.direnv/
+/.local/
+/ref/
+/.idea/
+*.iml
+.env
+.env.*
+.DS_Store
+/result
+/.claude/
