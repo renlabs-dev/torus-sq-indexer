@@ -4,16 +4,17 @@
 //! Strategy: blocks are fetched concurrently but committed strictly in order,
 //! one transaction per block, with the resume position in `indexer_status`.
 //! Every balance change on Torus emits a `Balances.*` event (emission rewards
-//! included) and stake is a named reserve, so refreshing `System::Account` for
-//! every address mentioned in `Balances`/`Torus0` events keeps balances exact.
-//! A periodic full `System::Account` scan at the tip is the safety net that
-//! also picks up accounts never touched by an event (e.g. genesis allocations).
+//! included), so refreshing `System::Account` for addresses mentioned in
+//! events keeps free balances current. Stake is the exact sum of
+//! `Torus0::StakingTo[account, *]`, not a proxy through reserved balance.
+//! A periodic full account/stake scan at the tip is the safety net that also
+//! picks up accounts never touched by an event (e.g. genesis allocations).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures::{StreamExt, stream::FuturesOrdered};
+use futures::{StreamExt, stream::FuturesUnordered};
 use parity_scale_codec::Decode;
 use sqlx::PgPool;
 use subxt::{
@@ -49,6 +50,7 @@ async fn sync_chain(config: &Config, pool: &PgPool) -> Result<()> {
     let chain = Chain::connect(&config.rpc_url).await?;
     insert_genesis_bridge_credits(pool).await?;
     let mut specs = SpecVersions::bootstrap(&chain).await?;
+    reconcile_resume_accounts(&chain, pool).await?;
 
     loop {
         let target = chain.finalized_height().await?;
@@ -84,16 +86,39 @@ async fn sync_range(
     to: u64,
     concurrency: usize,
 ) -> Result<()> {
-    let mut next = from;
-    let mut pending = FuturesOrdered::new();
+    let concurrency = concurrency.max(1);
+    let reorder_limit = concurrency.saturating_mul(4);
+    let mut next_fetch = from;
+    let mut next_commit = from;
+    let mut pending = FuturesUnordered::new();
+    let mut ready = BTreeMap::new();
 
-    while next <= to || !pending.is_empty() {
-        while next <= to && pending.len() < concurrency {
-            pending.push_back(fetch_block(chain, specs.spec_for(next), next));
-            next += 1;
+    while next_commit <= to {
+        while next_fetch <= to
+            && pending.len() < concurrency
+            && pending.len() + ready.len() < reorder_limit
+        {
+            pending.push(fetch_block(chain, specs.spec_for(next_fetch), next_fetch));
+            next_fetch += 1;
         }
-        if let Some(block) = pending.next().await {
-            commit_block(pool, block?).await?;
+
+        while let Some(block) = ready.remove(&next_commit) {
+            commit_block(pool, block).await?;
+            next_commit += 1;
+        }
+        if next_commit > to {
+            break;
+        }
+
+        let Some(block) = pending.next().await else {
+            bail!("sync scheduler stalled at block {next_commit}");
+        };
+        let block = block?;
+        if block.height == next_commit {
+            commit_block(pool, block).await?;
+            next_commit += 1;
+        } else {
+            ready.insert(block.height, block);
         }
     }
     Ok(())
@@ -116,7 +141,7 @@ struct Transfer {
 struct AccountBalance {
     address: String,
     free: u128,
-    staked: u128,
+    staked: Option<u128>,
 }
 
 async fn fetch_block(chain: &Chain, spec_version: u32, height: u64) -> Result<BlockData> {
@@ -126,6 +151,7 @@ async fn fetch_block(chain: &Chain, spec_version: u32, height: u64) -> Result<Bl
 
     let mut transfers = Vec::new();
     let mut touched = BTreeSet::new();
+    let mut stake_touched = BTreeSet::new();
     for event in events.iter() {
         let event = event?;
         let pallet = event.pallet_name();
@@ -135,6 +161,9 @@ async fn fetch_block(chain: &Chain, spec_version: u32, height: u64) -> Result<Bl
         let fields: Vec<Value<u32>> = event.field_values()?.values().cloned().collect();
         for field in &fields {
             collect_account_ids(field, &mut touched);
+            if pallet == "Torus0" {
+                collect_account_ids(field, &mut stake_touched);
+            }
         }
         if pallet == "Balances" && event.variant_name() == "Transfer" {
             let (Some(from), Some(to), Some(amount)) = (
@@ -153,8 +182,12 @@ async fn fetch_block(chain: &Chain, spec_version: u32, height: u64) -> Result<Bl
         }
     }
 
-    let accounts =
-        futures::future::try_join_all(touched.iter().map(|id| chain.account_at(hash, *id))).await?;
+    let accounts = futures::future::try_join_all(
+        touched
+            .iter()
+            .map(|id| chain.account_at(hash, *id, stake_touched.contains(id))),
+    )
+    .await?;
 
     let timestamp_ms = chain.timestamp_at(hash).await?.unwrap_or(0);
     if height > 0 && timestamp_ms == 0 {
@@ -213,23 +246,40 @@ async fn upsert_account(
 ) -> Result<()> {
     sqlx::query(
         "insert into accounts (address, free, staked, updated_height)
-         values ($1, $2::numeric, $3::numeric, $4)
+         values ($1, $2::numeric, coalesce($3::numeric, 0), $4)
          on conflict (address) do update set
              free = excluded.free,
-             staked = excluded.staked,
+             staked = coalesce($3::numeric, accounts.staked),
              updated_height = excluded.updated_height",
     )
     .bind(&account.address)
     .bind(account.free.to_string())
-    .bind(account.staked.to_string())
+    .bind(account.staked.map(|staked| staked.to_string()))
     .bind(height as i64)
     .execute(executor)
     .await?;
     Ok(())
 }
 
-/// Full `System::Account` scan at the tip. Runs once when first caught up,
-/// then every `rescan_interval` blocks; removes accounts that left storage.
+async fn reconcile_resume_accounts(chain: &Chain, pool: &PgPool) -> Result<()> {
+    let last = last_height(pool).await?;
+    if last < 0 {
+        return Ok(());
+    }
+
+    let last_rescan =
+        sqlx::query_scalar::<_, i64>("select last_rescan_height from indexer_status where id")
+            .fetch_one(pool)
+            .await?;
+    if last_rescan >= last {
+        return Ok(());
+    }
+
+    rescan_accounts_at(chain, pool, last as u64).await
+}
+
+/// Full account/stake scan at the tip. Runs once when first caught up, then
+/// every `rescan_interval` blocks; removes accounts that left storage.
 async fn maybe_rescan_accounts(
     chain: &Chain,
     pool: &PgPool,
@@ -244,24 +294,24 @@ async fn maybe_rescan_accounts(
         return Ok(());
     }
 
-    let hash = chain.block_hash(target).await?;
+    rescan_accounts_at(chain, pool, target).await
+}
+
+async fn rescan_accounts_at(chain: &Chain, pool: &PgPool, height: u64) -> Result<()> {
+    let hash = chain.block_hash(height).await?;
     let accounts = chain.scan_accounts(hash).await?;
-    info!(
-        height = target,
-        count = accounts.len(),
-        "rescanning all accounts"
-    );
+    info!(height, count = accounts.len(), "rescanning all accounts");
 
     let mut tx = pool.begin().await?;
     for account in &accounts {
-        upsert_account(&mut *tx, account, target).await?;
+        upsert_account(&mut *tx, account, height).await?;
     }
     sqlx::query("delete from accounts where updated_height < $1")
-        .bind(target as i64)
+        .bind(height as i64)
         .execute(&mut *tx)
         .await?;
     sqlx::query("update indexer_status set last_rescan_height = $1, updated_at = now() where id")
-        .bind(target as i64)
+        .bind(height as i64)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -413,7 +463,12 @@ impl Chain {
             .transpose()
     }
 
-    async fn account_at(&self, hash: H256, id: [u8; 32]) -> Result<AccountBalance> {
+    async fn account_at(
+        &self,
+        hash: H256,
+        id: [u8; 32],
+        include_stake: bool,
+    ) -> Result<AccountBalance> {
         let mut key = storage_prefix("System", "Account");
         key.extend(sp_crypto_hashing::blake2_128(&id));
         key.extend(id);
@@ -424,26 +479,22 @@ impl Chain {
             .map(|data| decode_account(&data))
             .transpose()?
             .unwrap_or_default();
+        let staked = if include_stake {
+            Some(self.staking_to_sum(hash, id).await?)
+        } else {
+            None
+        };
         Ok(AccountBalance {
             address: AccountId32(id).to_string(),
             free: record.free,
-            staked: record.reserved,
+            staked,
         })
     }
 
     async fn scan_accounts(&self, hash: H256) -> Result<Vec<AccountBalance>> {
+        let stakes = self.scan_staking_to(hash).await?;
         let prefix = storage_prefix("System", "Account");
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        loop {
-            let page = self
-                .rpc
-                .state_get_keys_paged(&prefix, 1000, keys.last().map(Vec::as_slice), Some(hash))
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            keys.extend(page);
-        }
+        let keys = self.storage_keys(&prefix, hash).await?;
 
         let mut accounts = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(500) {
@@ -457,17 +508,82 @@ impl Chain {
                 .context("empty storage change set")?;
             for (key, value) in change_set.changes {
                 let Some(value) = value else { continue };
-                // Map key layout: 32-byte prefix ++ blake2_128 ++ account id.
-                let id: [u8; 32] = key.0.get(48..80).context("short account key")?.try_into()?;
+                let id = system_account_id_from_key(&key.0)?;
                 let record = decode_account(&value.0)?;
                 accounts.push(AccountBalance {
                     address: AccountId32(id).to_string(),
                     free: record.free,
-                    staked: record.reserved,
+                    staked: Some(stakes.get(&id).copied().unwrap_or_default()),
                 });
             }
         }
         Ok(accounts)
+    }
+
+    async fn staking_to_sum(&self, hash: H256, staker: [u8; 32]) -> Result<u128> {
+        let mut prefix = storage_prefix("Torus0", "StakingTo");
+        prefix.extend(staker);
+        let keys = self.storage_keys(&prefix, hash).await?;
+        self.sum_u128_storage_values(&keys, hash).await
+    }
+
+    async fn scan_staking_to(&self, hash: H256) -> Result<HashMap<[u8; 32], u128>> {
+        let prefix = storage_prefix("Torus0", "StakingTo");
+        let keys = self.storage_keys(&prefix, hash).await?;
+        let mut stakes = HashMap::new();
+
+        for chunk in keys.chunks(500) {
+            let change_sets = self
+                .rpc
+                .state_query_storage_at(chunk.iter().map(Vec::as_slice), Some(hash))
+                .await?;
+            let change_set = change_sets
+                .into_iter()
+                .next()
+                .context("empty storage change set")?;
+            for (key, value) in change_set.changes {
+                let Some(value) = value else { continue };
+                let staker = staking_to_staker_from_key(&key.0)?;
+                let amount = decode_exact::<u128>(&value.0)?;
+                *stakes.entry(staker).or_default() += amount;
+            }
+        }
+
+        Ok(stakes)
+    }
+
+    async fn sum_u128_storage_values(&self, keys: &[Vec<u8>], hash: H256) -> Result<u128> {
+        let mut sum = 0u128;
+        for chunk in keys.chunks(500) {
+            let change_sets = self
+                .rpc
+                .state_query_storage_at(chunk.iter().map(Vec::as_slice), Some(hash))
+                .await?;
+            let change_set = change_sets
+                .into_iter()
+                .next()
+                .context("empty storage change set")?;
+            for (_, value) in change_set.changes {
+                let Some(value) = value else { continue };
+                sum = sum.saturating_add(decode_exact::<u128>(&value.0)?);
+            }
+        }
+        Ok(sum)
+    }
+
+    async fn storage_keys(&self, prefix: &[u8], hash: H256) -> Result<Vec<Vec<u8>>> {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let page = self
+                .rpc
+                .state_get_keys_paged(prefix, 1000, keys.last().map(Vec::as_slice), Some(hash))
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            keys.extend(page);
+        }
+        Ok(keys)
     }
 }
 
@@ -538,13 +654,11 @@ fn storage_prefix(pallet: &str, entry: &str) -> Vec<u8> {
     key
 }
 
-/// `System::Account` value. Only free/reserved are needed; they have been the
-/// first two `u128`s of `AccountData` in every Torus runtime so far, and stake
-/// is a named reserve, so `reserved` is the staked balance.
+/// `System::Account` value. Only free is used for the explorer balance; exact
+/// Torus stake comes from `Torus0::StakingTo`.
 #[derive(Debug, Default, Decode)]
 struct AccountRecord {
     free: u128,
-    reserved: u128,
 }
 
 #[derive(Debug, Decode)]
@@ -554,17 +668,28 @@ struct AccountInfo {
     _providers: u32,
     _sufficients: u32,
     free: u128,
-    reserved: u128,
+    _reserved: u128,
     _frozen: u128,
     _flags: u128,
 }
 
 fn decode_account(encoded: &[u8]) -> Result<AccountRecord> {
     let info = decode_exact::<AccountInfo>(encoded)?;
-    Ok(AccountRecord {
-        free: info.free,
-        reserved: info.reserved,
-    })
+    Ok(AccountRecord { free: info.free })
+}
+
+fn system_account_id_from_key(key: &[u8]) -> Result<[u8; 32]> {
+    key.get(48..80)
+        .context("short System::Account key")?
+        .try_into()
+        .context("invalid System::Account key")
+}
+
+fn staking_to_staker_from_key(key: &[u8]) -> Result<[u8; 32]> {
+    key.get(32..64)
+        .context("short Torus0::StakingTo key")?
+        .try_into()
+        .context("invalid Torus0::StakingTo key")
 }
 
 fn decode_exact<T: Decode>(encoded: &[u8]) -> Result<T> {
@@ -632,10 +757,32 @@ mod tests {
 
         let record = decode_account(&encoded).unwrap();
         assert_eq!(record.free, 100);
-        assert_eq!(record.reserved, 25);
 
         encoded.push(0);
         assert!(decode_account(&encoded).is_err());
+    }
+
+    #[test]
+    fn extracts_system_account_id_from_storage_key() {
+        let id = [7u8; 32];
+        let mut key = storage_prefix("System", "Account");
+        key.extend(sp_crypto_hashing::blake2_128(&id));
+        key.extend(id);
+
+        assert_eq!(system_account_id_from_key(&key).unwrap(), id);
+        assert!(system_account_id_from_key(&key[..79]).is_err());
+    }
+
+    #[test]
+    fn extracts_staking_to_staker_from_storage_key() {
+        let staker = [7u8; 32];
+        let staked = [9u8; 32];
+        let mut key = storage_prefix("Torus0", "StakingTo");
+        key.extend(staker);
+        key.extend(staked);
+
+        assert_eq!(staking_to_staker_from_key(&key).unwrap(), staker);
+        assert!(staking_to_staker_from_key(&key[..63]).is_err());
     }
 
     #[test]

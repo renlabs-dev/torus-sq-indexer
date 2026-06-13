@@ -34,7 +34,7 @@ pub struct Config {
     #[arg(long, env = "TORUS_INDEXER_BIND", default_value = "0.0.0.0:8080")]
     pub bind: SocketAddr,
     /// Concurrent block fetches during backfill.
-    #[arg(long, env = "TORUS_SYNC_CONCURRENCY", default_value_t = 32)]
+    #[arg(long, env = "TORUS_SYNC_CONCURRENCY", default_value_t = 96)]
     pub concurrency: usize,
     /// Blocks between full account re-scans once caught up to the tip.
     #[arg(long, env = "TORUS_RESCAN_INTERVAL", default_value_t = 10_000)]

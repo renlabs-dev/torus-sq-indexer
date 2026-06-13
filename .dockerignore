@@ -1,0 +1,23 @@
+.git
+**/.git
+target
+**/target
+.local
+.direnv
+.env
+.env.*
+deploy/.env
+node_modules
+**/node_modules
+dist
+**/dist
+**/.data
+
+# Reference checkouts are useful locally, but the deploy image only needs the
+# minimal explorer build context.
+ref/5.161.91.76-explorer
+ref/infra
+ref/torus-sq-indexer
+ref/torus-substrate
+ref/torus-ts
+ref/torusform

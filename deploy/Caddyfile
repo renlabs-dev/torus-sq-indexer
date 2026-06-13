@@ -1,0 +1,17 @@
+:80 {
+	encode zstd gzip
+
+	handle /v1/* {
+		reverse_proxy indexer:8080
+	}
+
+	handle /health {
+		reverse_proxy indexer:8080
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: torus_indexer
+      POSTGRES_USER: torus_indexer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U torus_indexer -d torus_indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: deploy/indexer.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://torus_indexer:${POSTGRES_PASSWORD}@postgres:5432/torus_indexer
+      TORUS_RPC_URL: ${TORUS_RPC_URL:-wss://archive.torus.network}
+      TORUS_INDEXER_BIND: 0.0.0.0:8080
+      TORUS_SYNC_CONCURRENCY: ${TORUS_SYNC_CONCURRENCY:-96}
+      TORUS_RESCAN_INTERVAL: ${TORUS_RESCAN_INTERVAL:-10000}
+      RUST_LOG: ${RUST_LOG:-torus_indexer=info}
+    expose:
+      - "8080"
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/caddy.Dockerfile
+      args:
+        VITE_INDEXER_API_URL: ${VITE_INDEXER_API_URL:-}
+    restart: unless-stopped
+    depends_on:
+      - indexer
+    ports:
+      - "80:80"
+
+volumes:
+  postgres-data:

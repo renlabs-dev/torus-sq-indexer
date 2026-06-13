@@ -44,7 +44,7 @@ Config (env or flags):
 | `DATABASE_URL` | — (required; devshell defaults to the local db) |
 | `TORUS_RPC_URL` | `wss://archive.torus.network` |
 | `TORUS_INDEXER_BIND` | `0.0.0.0:8080` |
-| `TORUS_SYNC_CONCURRENCY` | `32` |
+| `TORUS_SYNC_CONCURRENCY` | `96` |
 | `TORUS_RESCAN_INTERVAL` | `10000` |
 
 ## API
@@ -62,23 +62,30 @@ GET /v1/accounts/{address}              → { address, free, staked, total, upda
 
 ## Deploy
 
-The flake ships `packages.default` and `nixosModules.default` (one systemd
-unit + local Postgres with socket peer auth). Attach to a torusform-style host
-and `colmena apply`:
+Fast self-host path is in `deploy/`: one Docker Compose project with Postgres,
+the Rust indexer, and Caddy serving the minimal explorer while proxying `/v1/*`
+to the indexer.
 
-```nix
-# host config
-imports = [ torus-indexer.nixosModules.default ];
-services.torus-indexer.enable = true;
+After rsyncing this repo and `ref/torus-explorer` to the server:
 
-# expose the API, e.g.:
-services.nginx.virtualHosts."index.torus.network" = {
-  enableACME = true;
-  forceSSL = true;
-  locations."/".proxyPass = "http://127.0.0.1:8080";
-};
+```sh
+cd /root/explorer/torus-sq-indexer
+chmod +x deploy/*.sh
+./deploy/up.sh
 ```
 
-The explorer (`ref/torus-explorer`, branch `minimal`) is a static Vite SPA on
-Vercel — set `VITE_INDEXER_API_URL` to the deployed API and the existing Vercel
-pipeline does the rest.
+`deploy/up.sh` bootstraps Docker Compose on apt-based hosts, creates
+`deploy/.env` on first run, builds the images, starts the stack, and checks
+`/health`, `/`, and `/v1/status`. The Postgres data lives in the Docker volume
+`torus_explorer_postgres-data`.
+
+Useful follow-ups:
+
+```sh
+./deploy/status.sh
+./deploy/logs.sh
+```
+
+The flake still ships `packages.default` and `nixosModules.default` for a later
+torusform/NixOS deployment, but the Compose path is the fastest production path
+for `torex.rs`.
